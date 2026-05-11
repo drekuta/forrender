@@ -6,13 +6,6 @@ const pdfParse = require('pdf-parse');
 const PizZip = require('pizzip');
 const Docxtemplater = require('docxtemplater');
 
-const fs = require('fs');
-const path = require('path');
-const os = require('os');
-
-const { createWorker } = require('tesseract.js');
-const pdfPoppler = require('pdf-poppler');
-
 const app = express();
 
 const PORT = process.env.PORT || 10000;
@@ -33,7 +26,13 @@ function safeText(value) {
 }
 
 function responseText(res, payload) {
-  const text = safeText(payload.text || payload.data || payload.content || payload.output || '');
+  const text = safeText(
+    payload.text ||
+    payload.data ||
+    payload.content ||
+    payload.output ||
+    ''
+  );
 
   return res.json({
     success: Boolean(payload.success),
@@ -94,6 +93,7 @@ app.get('/', (req, res) => {
       'POST /extract-pdf',
       'POST /extract-pdf-ocr',
       'POST /fill-docx-template',
+      'POST /render-docx',
     ],
   });
 });
@@ -112,6 +112,7 @@ app.post('/extract-docx', upload.single('file'), async (req, res) => {
     if (!req.file) {
       return res.status(400).json({
         success: false,
+        source: 'docx',
         error: 'No DOCX file uploaded. Expected form-data field: file',
       });
     }
@@ -150,6 +151,7 @@ app.post('/extract-pdf', upload.single('file'), async (req, res) => {
     if (!req.file) {
       return res.status(400).json({
         success: false,
+        source: 'pdf_text_layer',
         error: 'No PDF file uploaded. Expected form-data field: file',
       });
     }
@@ -182,12 +184,13 @@ app.post('/extract-pdf', upload.single('file'), async (req, res) => {
   }
 });
 
+/**
+ * ВАЖНО:
+ * Этот endpoint пока только подтверждает, что маршрут OCR существует.
+ * Полноценный OCR через Render Free лучше не запускать прямо здесь,
+ * потому что для PDF-сканов нужны poppler/tesseract или внешний OCR API.
+ */
 app.post('/extract-pdf-ocr', upload.single('file'), async (req, res) => {
-  const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pdf-ocr-'));
-  const pdfPath = path.join(workDir, 'input.pdf');
-
-  let worker = null;
-
   try {
     if (!req.file) {
       return res.status(400).json({
@@ -197,80 +200,25 @@ app.post('/extract-pdf-ocr', upload.single('file'), async (req, res) => {
       });
     }
 
-    fs.writeFileSync(pdfPath, req.file.buffer);
-
-    const outputPrefix = 'page';
-
-    await pdfPoppler.convert(pdfPath, {
-      format: 'png',
-      out_dir: workDir,
-      out_prefix: outputPrefix,
-      page: null,
-      scale: 1800,
-    });
-
-    const imageFiles = fs
-      .readdirSync(workDir)
-      .filter(name => name.toLowerCase().endsWith('.png'))
-      .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }))
-      .map(name => path.join(workDir, name));
-
-    if (imageFiles.length === 0) {
-      return res.status(422).json({
-        success: false,
-        source: 'pdf_ocr',
-        error: 'PDF was not converted to images. OCR cannot continue.',
-      });
-    }
-
-    worker = await createWorker('rus+eng');
-
-    const parts = [];
-
-    for (let i = 0; i < imageFiles.length; i++) {
-      const result = await worker.recognize(imageFiles[i]);
-      const pageText = safeText(result?.data?.text || '');
-
-      parts.push(`--- PAGE ${i + 1} ---\n${pageText}`);
-    }
-
-    const text = safeText(parts.join('\n\n'));
-
-    return responseText(res, {
-      success: true,
+    return res.status(501).json({
+      success: false,
       source: 'pdf_ocr',
-      text,
-      metadata: {
+      error: 'OCR endpoint exists, but OCR engine is not implemented on this Render service yet.',
+      hint: 'n8n reached /extract-pdf-ocr successfully. The route works. Next step: connect a real OCR engine or external OCR API.',
+      receivedFile: {
         originalname: req.file.originalname,
         mimetype: req.file.mimetype,
         size: req.file.size,
-        pages: imageFiles.length,
-        textLength: text.length,
       },
     });
   } catch (error) {
-    console.error('OCR PDF error:', error);
+    console.error('OCR PDF endpoint error:', error);
 
     return res.status(500).json({
       success: false,
       source: 'pdf_ocr',
       error: String(error.message || error),
-      hint: 'If this happens on Render Free, OCR may require more memory/time or Poppler support.',
     });
-  } finally {
-    try {
-      if (worker) {
-        await worker.terminate();
-      }
-    } catch (e) {
-      console.error('OCR worker terminate error:', e);
-    }
-
-    try {
-      fs.rmSync(workDir, { recursive: true, force: true });
-    } catch (e) {
-      console.error('Cleanup OCR temp dir error:', e);
-    }
   }
 });
 
@@ -281,6 +229,7 @@ app.post('/fill-docx-template', upload.any(), async (req, res) => {
     if (!templateFile) {
       return res.status(400).json({
         success: false,
+        source: 'fill_docx_template',
         error: 'No DOCX template uploaded. Expected form-data field: template or file',
       });
     }
@@ -355,8 +304,84 @@ app.post('/fill-docx-template', upload.any(), async (req, res) => {
 });
 
 app.post('/render-docx', upload.any(), async (req, res) => {
-  req.url = '/fill-docx-template';
-  return app._router.handle(req, res);
+  try {
+    const templateFile = getUploadedFile(req, ['template', 'file']);
+
+    if (!templateFile) {
+      return res.status(400).json({
+        success: false,
+        source: 'render_docx',
+        error: 'No DOCX template uploaded. Expected form-data field: template or file',
+      });
+    }
+
+    const rawData =
+      req.body.data ||
+      req.body.json ||
+      req.body.payload ||
+      req.body.proposalData ||
+      '{}';
+
+    const data = parseJsonField(rawData);
+
+    const zip = new PizZip(templateFile.buffer);
+
+    const doc = new Docxtemplater(zip, {
+      paragraphLoop: true,
+      linebreaks: true,
+      delimiters: {
+        start: '{{',
+        end: '}}',
+      },
+      nullGetter() {
+        return '';
+      },
+    });
+
+    doc.render(data);
+
+    const outputBuffer = doc.getZip().generate({
+      type: 'nodebuffer',
+      compression: 'DEFLATE',
+    });
+
+    const fileName =
+      req.body.fileName ||
+      req.body.filename ||
+      `kp_${new Date().toISOString().slice(0, 10)}.docx`;
+
+    res.setHeader(
+      'Content-Type',
+      'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+    );
+
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="${encodeURIComponent(fileName)}"`
+    );
+
+    return res.send(outputBuffer);
+  } catch (error) {
+    console.error('Render DOCX error:', error);
+
+    let details = undefined;
+
+    if (error.properties && error.properties.errors) {
+      details = error.properties.errors.map(e => ({
+        id: e.properties?.id,
+        explanation: e.properties?.explanation,
+        file: e.properties?.file,
+        tag: e.properties?.xtag,
+      }));
+    }
+
+    return res.status(500).json({
+      success: false,
+      source: 'render_docx',
+      error: String(error.message || error),
+      details,
+    });
+  }
 });
 
 app.use((req, res) => {
@@ -369,6 +394,7 @@ app.use((req, res) => {
       'POST /extract-pdf',
       'POST /extract-pdf-ocr',
       'POST /fill-docx-template',
+      'POST /render-docx',
     ],
   });
 });
