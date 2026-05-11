@@ -5,6 +5,7 @@ const mammoth = require('mammoth');
 const pdfParse = require('pdf-parse');
 const PizZip = require('pizzip');
 const Docxtemplater = require('docxtemplater');
+const FormData = require('form-data');
 
 const app = express();
 
@@ -184,12 +185,6 @@ app.post('/extract-pdf', upload.single('file'), async (req, res) => {
   }
 });
 
-/**
- * ВАЖНО:
- * Этот endpoint пока только подтверждает, что маршрут OCR существует.
- * Полноценный OCR через Render Free лучше не запускать прямо здесь,
- * потому что для PDF-сканов нужны poppler/tesseract или внешний OCR API.
- */
 app.post('/extract-pdf-ocr', upload.single('file'), async (req, res) => {
   try {
     if (!req.file) {
@@ -200,15 +195,86 @@ app.post('/extract-pdf-ocr', upload.single('file'), async (req, res) => {
       });
     }
 
-    return res.status(501).json({
-      success: false,
+    const apiKey = process.env.OCR_SPACE_API_KEY;
+
+    if (!apiKey) {
+      return res.status(500).json({
+        success: false,
+        source: 'pdf_ocr',
+        error: 'OCR_SPACE_API_KEY is not set in Render environment variables.',
+      });
+    }
+
+    const form = new FormData();
+
+    form.append('file', req.file.buffer, {
+      filename: req.file.originalname || 'scan.pdf',
+      contentType: req.file.mimetype || 'application/pdf',
+    });
+
+    form.append('language', 'rus');
+    form.append('isOverlayRequired', 'false');
+    form.append('OCREngine', '2');
+    form.append('scale', 'true');
+    form.append('detectOrientation', 'true');
+    form.append('isTable', 'true');
+
+    const response = await fetch('https://api.ocr.space/parse/image', {
+      method: 'POST',
+      headers: {
+        apikey: apiKey,
+        ...form.getHeaders(),
+      },
+      body: form,
+    });
+
+    const result = await response.json();
+
+    if (!response.ok || result.IsErroredOnProcessing) {
+      return res.status(502).json({
+        success: false,
+        source: 'pdf_ocr',
+        error: 'OCR.Space failed to process file.',
+        details: result,
+      });
+    }
+
+    const parsedResults = Array.isArray(result.ParsedResults)
+      ? result.ParsedResults
+      : [];
+
+    const text = parsedResults
+      .map((page, index) => {
+        const pageText = safeText(page.ParsedText || '');
+        return `--- PAGE ${index + 1} ---\n${pageText}`;
+      })
+      .join('\n\n')
+      .trim();
+
+    if (!text || text.length < 30) {
+      return res.status(422).json({
+        success: false,
+        source: 'pdf_ocr',
+        error: 'OCR completed, but extracted text is empty or too short.',
+        details: result,
+      });
+    }
+
+    return res.json({
+      success: true,
       source: 'pdf_ocr',
-      error: 'OCR endpoint exists, but OCR engine is not implemented on this Render service yet.',
-      hint: 'n8n reached /extract-pdf-ocr successfully. The route works. Next step: connect a real OCR engine or external OCR API.',
-      receivedFile: {
+      text,
+      data: text,
+      content: text,
+      output: text,
+      messages: [],
+      metadata: {
         originalname: req.file.originalname,
         mimetype: req.file.mimetype,
         size: req.file.size,
+        ocrEngine: 2,
+        language: 'rus',
+        textLength: text.length,
       },
     });
   } catch (error) {
